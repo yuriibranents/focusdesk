@@ -1,0 +1,4 @@
+aiogram>=3.0
+paho-mqtt>=2.0
+python-dotenv>=1.0
+pytest>=8.0
