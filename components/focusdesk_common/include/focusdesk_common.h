@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define FD_API_VERSION      1       /* збільшувати при зміні контракту */
+#define FD_API_VERSION      2       /* збільшувати при зміні контракту */
 #define FOCUSDESK_COMMON_VERSION FD_API_VERSION  /* сумісність зі старим app_main.c */
 
 /* ---------- Ліміти ---------- */
@@ -54,6 +54,7 @@ typedef enum {
     /* sitting_monitor */
     EVT_BREAK_DUE,
     EVT_BREAK_DONE,
+    EVT_ABSENCE_ALERT,      /* "Повернись": відсутність >= absence_alert_min, один раз */
     /* focus_session */
     EVT_FOCUS_START,
     EVT_FOCUS_PAUSE,
@@ -87,7 +88,8 @@ typedef enum {
     SCREEN_FOCUS_PAUSED,
     SCREEN_BREAK,           /* нагадування про перерву */
     SCREEN_TASK,            /* текст задачі */
-    SCREEN_ERROR
+    SCREEN_ERROR,
+    SCREEN_ABSENCE_ALERT    /* "Повернись до роботи" */
 } ui_screen_t;
 
 typedef enum {
@@ -95,14 +97,18 @@ typedef enum {
     RING_STATIC,            /* постійний колір */
     RING_PROGRESS,          /* прогрес сесії (value = 0..100) */
     RING_BLINK,             /* мигання */
-    RING_PULSE              /* плавне «дихання» */
+    RING_PULSE,             /* плавне «дихання» */
+    RING_BLINK_FAST,        /* швидке мигання: задача (TASK_DUE) */
+    RING_BLINK_SLOW         /* повільне мигання: "Повернись" (ABSENCE_ALERT) */
 } ring_mode_t;
 
 typedef enum {
     SOUND_NONE = 0,
     SOUND_BEEP_SHORT,
     SOUND_BEEP_ALERT,       /* нагадування про задачу */
-    SOUND_BEEP_DONE         /* завершення сесії */
+    SOUND_BEEP_DONE,        /* завершення сесії */
+    SOUND_BEEP_FAST,        /* швидкий звук: задача */
+    SOUND_BEEP_SLOW         /* повільний звук: "Повернись" */
 } sound_t;
 
 typedef struct {
@@ -148,7 +154,8 @@ typedef struct {
 /* ---------- Конфігурація (7.5 документа) ---------- */
 typedef struct {
     uint32_t sit_threshold_min;         /* 60 (налаштовується 60..90) */
-    uint32_t break_reset_min;           /* 5  — відсутність, що скидає лічильник */
+    uint32_t break_reset_min;           /* 10 — відсутність, що скидає лічильник */
+    uint32_t absence_alert_min;         /* 20 — "Повернись": відсутність від її початку */
     uint32_t presence_lost_debounce_s;  /* 10 */
     uint32_t presence_back_debounce_s;  /* 2  */
     uint32_t escalation_1_min;          /* 2  — нагадування після BREAK_DUE */
@@ -163,7 +170,8 @@ static inline config_t fd_config_default(void)
 {
     config_t c = {
         .sit_threshold_min        = 60,
-        .break_reset_min          = 5,
+        .break_reset_min          = 10,
+        .absence_alert_min        = 20,
         .presence_lost_debounce_s = 10,
         .presence_back_debounce_s = 2,
         .escalation_1_min         = 2,
