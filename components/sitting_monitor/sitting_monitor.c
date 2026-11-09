@@ -26,6 +26,8 @@ void sm_handle_event(sitting_monitor_t *sm, const event_t *in)
         if (sm->state == SM_SITTING || sm->state == SM_BREAK_DUE) {
             sm->break_was_due = (sm->state == SM_BREAK_DUE);
             sm->away_s = 0;
+            sm->tracking_absence = true;
+            sm->alert_sent = false;
             sm->state  = SM_AWAY;
         }
         break;
@@ -33,11 +35,15 @@ void sm_handle_event(sitting_monitor_t *sm, const event_t *in)
     case EVT_PRESENCE_BACK:
         if (sm->state == SM_ABSENT) {
             sm->sit_s = 0;
+            sm->away_s = 0;
+            sm->tracking_absence = false;
+            sm->alert_sent = false;
             sm->state = SM_SITTING;
         } else if (sm->state == SM_AWAY) {
             /* коротка відсутність: лічильник збережено */
             sm->state = sm->break_was_due ? SM_BREAK_DUE : SM_SITTING;
             sm->away_s = 0;
+            sm->tracking_absence = false;
             sm->break_was_due = false;
         }
         break;
@@ -54,6 +60,7 @@ bool sm_tick(sitting_monitor_t *sm, uint32_t dt_s, fd_time_us_t now_us,
 
     const uint32_t threshold_s = sm->cfg.sit_threshold_min * 60u;
     const uint32_t reset_s     = sm->cfg.break_reset_min * 60u;
+    const uint32_t alert_s     = sm->cfg.absence_alert_min * 60u;
 
     switch (sm->state) {
     case SM_SITTING:
@@ -74,8 +81,8 @@ bool sm_tick(sitting_monitor_t *sm, uint32_t dt_s, fd_time_us_t now_us,
         if (sm->away_s >= reset_s) {
             int32_t away_min = (int32_t)(sm->away_s / 60u);
             sm->sit_s = 0;
-            sm->away_s = 0;
             sm->break_was_due = false;
+            /* away_s НЕ скидаємо: відлік "Повернись" іде від початку відсутності */
             sm->state = SM_ABSENT;
             make_event(out, EVT_BREAK_DONE, now_us, away_min);
             return true;
@@ -83,6 +90,17 @@ bool sm_tick(sitting_monitor_t *sm, uint32_t dt_s, fd_time_us_t now_us,
         break;
 
     case SM_ABSENT:
+        if (sm->tracking_absence) {
+            sm->away_s += dt_s;
+            if (!sm->alert_sent && sm->away_s >= alert_s) {
+                sm->alert_sent = true;
+                make_event(out, EVT_ABSENCE_ALERT, now_us,
+                           (int32_t)(sm->away_s / 60u));
+                return true;
+            }
+        }
+        break;
+
     default:
         break;
     }
