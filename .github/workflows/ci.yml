@@ -32,4 +32,4 @@ jobs:
           python-version: "3.11"
       - run: |
           pip install -r bot/requirements.txt
-          pytest bot || [ $? -eq 5 ]
+          pytest
