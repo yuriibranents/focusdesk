@@ -11,3 +11,11 @@ target_include_directories(test_sitting_monitor PRIVATE
   ../../components/focusdesk_common/include
   ../../components/sitting_monitor/include)
 add_test(NAME sitting_monitor COMMAND test_sitting_monitor)
+
+add_executable(test_focus_session
+  test_focus_session.c
+  ../../components/focus_session/focus_session.c)
+target_include_directories(test_focus_session PRIVATE
+  ../../components/focusdesk_common/include
+  ../../components/focus_session/include)
+add_test(NAME focus_session COMMAND test_focus_session)
