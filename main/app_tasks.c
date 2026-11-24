@@ -12,19 +12,29 @@
 #include "sitting_monitor.h"
 #include "focus_session.h"
 #include "task_scheduler.h"
+#include "arbiter.h"
+#include "ld2410_parser.h"
+#include "presence_filter.h"
+#include "presence_hw.h"
 
 static const char *TAG = "app";
 
+/* FD_SIM_PRESENCE: 1 = вигадана присутність замість радара (для столу без радара).
+ * FD_SIM_DEMO:     1 = вигаданий UTC, демо-розклад і кнопки «бачу»/«виконано»
+ *                  (до роботи C/D). */
 #ifndef FD_SIM_PRESENCE
-#define FD_SIM_PRESENCE 1
+#define FD_SIM_PRESENCE 0
+#endif
+#ifndef FD_SIM_DEMO
+#define FD_SIM_DEMO 1
 #endif
 
-/* Симуляція (до роботи C/D): вигаданий UTC і демо-розклад з однією задачею. */
 #define FD_SIM_UTC_BASE 1800000000LL
 
 static fd_hb_t          s_hb;
 static config_t         s_cfg;
 static task_scheduler_t s_ts;       /* ~1,4 КБ: static, а не на стеку задачі */
+static arbiter_t        s_arb;      /* ~0,7 КБ: теж static */
 
 static uint32_t now_ms(void)
 {
@@ -35,7 +45,7 @@ static uint32_t now_ms(void)
  * TODO(C): після SNTP повертати справжній UTC (time(NULL)). */
 static fd_unix_t utc_now(void)
 {
-#if FD_SIM_PRESENCE
+#if FD_SIM_DEMO
     return FD_SIM_UTC_BASE + (fd_unix_t)(esp_timer_get_time() / 1000000);
 #else
     return -1;
@@ -60,11 +70,35 @@ static void post_simple(event_type_t type, int32_t value)
 /* Logic Task                                                          */
 /* ------------------------------------------------------------------ */
 
+static void post_ui_cmd(const ui_cmd_t *cmd)
+{
+    (void)event_bus_post_ui(cmd, 0);    /* не блокуємо; при переповненні команда втрачається */
+}
+
+/* Вихідна подія автомата: лог і команда для UI від арбітра. */
 static void emit(const event_t *out)
 {
+    ui_cmd_t cmd;
     ESP_LOGI(TAG, "logic out: type=%d id=%d value=%d",
              (int)out->type, (int)out->id, (int)out->value);
-    /* TODO(B7): арбітр перетворює вихідні події на ui_cmd_t і шле в q_ui */
+    if (arb_handle_event(&s_arb, out, &cmd)) post_ui_cmd(&cmd);
+}
+
+/* Єдина точка прийому розкладу: C/D викличуть її з Sync Task. Після нового
+ * розкладу арбітр синхронізує список DUE-задач. */
+__attribute__((unused))
+static fd_err_t apply_schedule(const schedule_t *s)
+{
+    event_t ev;
+    fd_err_t err = ts_set_schedule(&s_ts, s, esp_timer_get_time(), &ev);
+    if (err == FD_OK) {
+        ui_cmd_t cmd;
+        const schedule_t *cur = ts_schedule(&s_ts);
+        if (arb_sync_tasks(&s_arb, cur->tasks, cur->task_count, &cmd))
+            post_ui_cmd(&cmd);
+        emit(&ev);
+    }
+    return err;
 }
 
 static void handle_input(const event_t *in, sitting_monitor_t *sm,
@@ -77,6 +111,13 @@ static void handle_input(const event_t *in, sitting_monitor_t *sm,
     sm_handle_event(sm, in);
     if (fs_handle_event(fs, in, &out)) emit(&out);
     if (ts_handle_event(&s_ts, in, &out)) emit(&out);
+
+    /* "Повернись" знімається поверненням людини: це подія присутності,
+     * а не вихід автомата, тому арбітр отримує її напряму. */
+    if (in->type == EVT_PRESENCE_BACK) {
+        ui_cmd_t cmd;
+        if (arb_handle_event(&s_arb, in, &cmd)) post_ui_cmd(&cmd);
+    }
 }
 
 static void handle_tick(uint32_t dt_s, sitting_monitor_t *sm,
@@ -88,6 +129,9 @@ static void handle_tick(uint32_t dt_s, sitting_monitor_t *sm,
     if (sm_tick(sm, dt_s, now_us, &out)) emit(&out);
     if (fs_tick(fs, dt_s, now_us, &out)) emit(&out);
     if (ts_tick(&s_ts, dt_s, utc_now(), now_us, &out)) emit(&out);
+
+    ui_cmd_t cmd;
+    if (arb_tick(&s_arb, dt_s, &cmd)) post_ui_cmd(&cmd);
 }
 
 static void logic_task(void *arg)
@@ -98,7 +142,8 @@ static void logic_task(void *arg)
     sm_init(&sm, &s_cfg);
     fs_init(&fs, &s_cfg);
     ts_init(&s_ts, &s_cfg);
-#if FD_SIM_PRESENCE
+    arb_init(&s_arb);
+#if FD_SIM_DEMO
     /* Демо-розклад: задача через 30 с після старту (замінить MQTT від C/D). */
     static schedule_t demo;
     memset(&demo, 0, sizeof(demo));
@@ -107,7 +152,7 @@ static void logic_task(void *arg)
     demo.tasks[0].id = 1;
     demo.tasks[0].time_utc = FD_SIM_UTC_BASE + 30;
     strncpy(demo.tasks[0].text, "Demo task", FD_TEXT_MAX - 1);
-    (void)ts_set_schedule(&s_ts, &demo, esp_timer_get_time(), NULL);
+    (void)apply_schedule(&demo);
 #endif
 
     uint32_t last_tick_ms = now_ms();
@@ -132,32 +177,114 @@ static void logic_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* Presence Task (заглушка до B3)                                      */
+/* Presence Task: радар LD2410C -> парсер -> фільтр -> події           */
 /* ------------------------------------------------------------------ */
 
+#define RADAR_SENSOR_TIMEOUT_MS 3000u   /* стільки без кадрів = датчик мовчить */
+#define RADAR_SWAP_AFTER_MS     5000u   /* без жодного кадру: міняємо RX/TX */
+
+static ld2410_parser_t   s_parser;      /* ~0,2 КБ: static */
+static presence_filter_t s_pf;
+
+static void post_event(const event_t *e)
+{
+    (void)event_bus_post(e, 0);
+}
+
+#if FD_SIM_PRESENCE
 static void presence_task(void *arg)
 {
     (void)arg;
-#if FD_SIM_PRESENCE
-    ESP_LOGW(TAG, "presence: SIMULATED (driver B3 not ready yet)");
+    ESP_LOGW(TAG, "presence: SIMULATED (no radar)");
     uint32_t sec = 0;
-#else
-    ESP_LOGW(TAG, "presence: stub, no events");
-#endif
     for (;;) {
         app_heartbeat(FD_HB_PRESENCE);
-#if FD_SIM_PRESENCE
         uint32_t phase = sec % 40u;
         if (phase == 3u)  post_simple(EVT_PRESENCE_BACK, 0);
         if (phase == 23u) post_simple(EVT_PRESENCE_LOST, 0);
-        /* Демо-задача: DUE на 30-й с, повтор на 90-й; кнопки «бачу» і «виконано». */
-        if (sec == 100u)  post_simple(EVT_TASK_SEEN, 0);
-        if (sec == 110u)  post_simple(EVT_TASK_DONE, 0);
         sec++;
-#endif
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+#else
+static void presence_task(void *arg)
+{
+    (void)arg;
+    int rx = PRESENCE_PIN_B;            /* 21 = RX за схемою A */
+    int tx = PRESENCE_PIN_A;            /* 18 = TX */
+
+    ld2410_init(&s_parser);
+    pf_init(&s_pf, &s_cfg, RADAR_SENSOR_TIMEOUT_MS, now_ms());
+
+    if (presence_hw_init(rx, tx) != FD_OK) {
+        ESP_LOGE(TAG, "presence: UART init failed");
+        event_t e = { .type = EVT_SYSTEM_ERROR, .value = (int32_t)FD_ERR_SENSOR };
+        post_event(&e);
+        for (;;) { app_heartbeat(FD_HB_PRESENCE); vTaskDelay(pdMS_TO_TICKS(500)); }
+    }
+    ESP_LOGI(TAG, "presence: radar driver started (RX=GPIO%d TX=GPIO%d)", rx, tx);
+
+    uint8_t         buf[64];
+    ld2410_frame_t  fr = {0};
+    uint32_t        last_log_ms  = now_ms();
+    uint32_t        last_swap_ms = now_ms();
+
+    for (;;) {
+        int n = presence_hw_read(buf, sizeof buf, 100);
+        uint32_t t = now_ms();
+        event_t ev;
+
+        for (int i = 0; i < n; i++) {
+            if (ld2410_feed(&s_parser, buf[i], &fr)) {
+                if (pf_sample(&s_pf, ld2410_present(&fr), t, &ev)) {
+                    ESP_LOGI(TAG, "presence: %s",
+                             ev.type == EVT_PRESENCE_BACK ? "BACK" : "LOST");
+                    post_event(&ev);
+                }
+            }
+        }
+        if (pf_tick(&s_pf, t, &ev)) {
+            ESP_LOGW(TAG, "presence: radar silent for %u ms", RADAR_SENSOR_TIMEOUT_MS);
+            post_event(&ev);
+        }
+
+        /* Жодного коректного кадру з самого старту: можливо, RX/TX навпаки. */
+        if (s_parser.frames_ok == 0 && (uint32_t)(t - last_swap_ms) >= RADAR_SWAP_AFTER_MS) {
+            int tmp = rx; rx = tx; tx = tmp;
+            ESP_LOGW(TAG, "presence: no frames, swapping pins -> RX=GPIO%d TX=GPIO%d", rx, tx);
+            (void)presence_hw_init(rx, tx);
+            ld2410_init(&s_parser);
+            last_swap_ms = t;
+        }
+
+        if ((uint32_t)(t - last_log_ms) >= 1000u) {
+            last_log_ms = t;
+            ESP_LOGI(TAG, "radar: frames=%u bad=%u skipped=%u raw=%d state=%d det=%ucm mov=%ucm/%u still=%ucm/%u | stable=%s sensor=%s",
+                     (unsigned)s_parser.frames_ok, (unsigned)s_parser.frames_bad,
+                     (unsigned)s_parser.bytes_skipped,
+                     (int)ld2410_present(&fr), (int)fr.target_state,
+                     (unsigned)fr.detect_cm, (unsigned)fr.moving_cm, (unsigned)fr.moving_energy,
+                     (unsigned)fr.still_cm, (unsigned)fr.still_energy,
+                     pf_present(&s_pf) ? "PRESENT" : "ABSENT",
+                     pf_sensor_ok(&s_pf) ? "ok" : "SILENT");
+        }
+        app_heartbeat(FD_HB_PRESENCE);
+    }
+}
+#endif
+
+#if FD_SIM_DEMO
+/* Демо кнопок до роботи C: «бачу» на 100-й с, «виконано» на 110-й. */
+static void demo_task(void *arg)
+{
+    (void)arg;
+    for (uint32_t sec = 0;; sec++) {
+        if (sec == 100u) post_simple(EVT_TASK_SEEN, 0);
+        if (sec == 110u) post_simple(EVT_TASK_DONE, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* UI Task (заглушка до роботи C)                                      */
@@ -169,8 +296,9 @@ static void ui_task(void *arg)
     for (;;) {
         ui_cmd_t cmd;
         if (event_bus_receive_ui(&cmd, 500) == FD_OK) {
-            ESP_LOGI(TAG, "ui cmd: screen=%d value=%d",
-                     (int)cmd.screen, (int)cmd.value);
+            ESP_LOGI(TAG, "ui cmd: screen=%d ring=%d sound=%d value=%d",
+                     (int)cmd.screen, (int)cmd.ring_mode, (int)cmd.sound,
+                     (int)cmd.value);
         }
         app_heartbeat(FD_HB_UI);
     }
@@ -247,9 +375,12 @@ fd_err_t app_tasks_start(void)
     bool ok =
         spawn(logic_task,    "logic",    FD_STACK_LOGIC,    FD_PRIO_LOGIC,    FD_CORE_APP)  &&
         spawn(ui_task,       "ui",       FD_STACK_UI,       FD_PRIO_UI,       FD_CORE_APP)  &&
-        spawn(presence_task, "presence", FD_STACK_PRESENCE, FD_PRIO_PRESENCE, FD_CORE_APP)  &&
+        spawn(presence_task, "presence", 4096,              FD_PRIO_PRESENCE, FD_CORE_APP)  &&
         spawn(sync_task,     "sync",     FD_STACK_SYNC,     FD_PRIO_SYNC,     FD_CORE_SYNC) &&
         spawn(monitor_task,  "monitor",  FD_STACK_MONITOR,  FD_PRIO_MONITOR,  tskNO_AFFINITY);
+#if FD_SIM_DEMO
+    if (ok) ok = spawn(demo_task, "demo", 2048, 2, FD_CORE_APP);
+#endif
 
     return ok ? FD_OK : FD_ERR_NO_MEM;
 }
