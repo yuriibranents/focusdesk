@@ -11,6 +11,7 @@
 #include "fd_heartbeat.h"
 #include "sitting_monitor.h"
 #include "focus_session.h"
+#include "task_scheduler.h"
 
 static const char *TAG = "app";
 
@@ -18,12 +19,27 @@ static const char *TAG = "app";
 #define FD_SIM_PRESENCE 1
 #endif
 
-static fd_hb_t  s_hb;
-static config_t s_cfg;
+/* Симуляція (до роботи C/D): вигаданий UTC і демо-розклад з однією задачею. */
+#define FD_SIM_UTC_BASE 1800000000LL
+
+static fd_hb_t          s_hb;
+static config_t         s_cfg;
+static task_scheduler_t s_ts;       /* ~1,4 КБ: static, а не на стеку задачі */
 
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Unix-час UTC або -1, якщо невідомий.
+ * TODO(C): після SNTP повертати справжній UTC (time(NULL)). */
+static fd_unix_t utc_now(void)
+{
+#if FD_SIM_PRESENCE
+    return FD_SIM_UTC_BASE + (fd_unix_t)(esp_timer_get_time() / 1000000);
+#else
+    return -1;
+#endif
 }
 
 void app_heartbeat(uint32_t bits)
@@ -60,6 +76,7 @@ static void handle_input(const event_t *in, sitting_monitor_t *sm,
 
     sm_handle_event(sm, in);
     if (fs_handle_event(fs, in, &out)) emit(&out);
+    if (ts_handle_event(&s_ts, in, &out)) emit(&out);
 }
 
 static void handle_tick(uint32_t dt_s, sitting_monitor_t *sm,
@@ -70,6 +87,7 @@ static void handle_tick(uint32_t dt_s, sitting_monitor_t *sm,
 
     if (sm_tick(sm, dt_s, now_us, &out)) emit(&out);
     if (fs_tick(fs, dt_s, now_us, &out)) emit(&out);
+    if (ts_tick(&s_ts, dt_s, utc_now(), now_us, &out)) emit(&out);
 }
 
 static void logic_task(void *arg)
@@ -79,6 +97,18 @@ static void logic_task(void *arg)
     focus_session_t   fs;
     sm_init(&sm, &s_cfg);
     fs_init(&fs, &s_cfg);
+    ts_init(&s_ts, &s_cfg);
+#if FD_SIM_PRESENCE
+    /* Демо-розклад: задача через 30 с після старту (замінить MQTT від C/D). */
+    static schedule_t demo;
+    memset(&demo, 0, sizeof(demo));
+    demo.schedule_version = 1;
+    demo.task_count = 1;
+    demo.tasks[0].id = 1;
+    demo.tasks[0].time_utc = FD_SIM_UTC_BASE + 30;
+    strncpy(demo.tasks[0].text, "Demo task", FD_TEXT_MAX - 1);
+    (void)ts_set_schedule(&s_ts, &demo, esp_timer_get_time(), NULL);
+#endif
 
     uint32_t last_tick_ms = now_ms();
     for (;;) {
@@ -120,6 +150,9 @@ static void presence_task(void *arg)
         uint32_t phase = sec % 40u;
         if (phase == 3u)  post_simple(EVT_PRESENCE_BACK, 0);
         if (phase == 23u) post_simple(EVT_PRESENCE_LOST, 0);
+        /* Демо-задача: DUE на 30-й с, повтор на 90-й; кнопки «бачу» і «виконано». */
+        if (sec == 100u)  post_simple(EVT_TASK_SEEN, 0);
+        if (sec == 110u)  post_simple(EVT_TASK_DONE, 0);
         sec++;
 #endif
         vTaskDelay(pdMS_TO_TICKS(1000));
