@@ -46,3 +46,11 @@ target_include_directories(test_task_scheduler PRIVATE
   ../../components/focusdesk_common/include
   ../../components/task_scheduler/include)
 add_test(NAME task_scheduler COMMAND test_task_scheduler)
+
+add_executable(test_arbiter
+  test_arbiter.c
+  ../../components/arbiter/arbiter.c)
+target_include_directories(test_arbiter PRIVATE
+  ../../components/focusdesk_common/include
+  ../../components/arbiter/include)
+add_test(NAME arbiter COMMAND test_arbiter)
