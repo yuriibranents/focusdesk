@@ -54,3 +54,11 @@ target_include_directories(test_arbiter PRIVATE
   ../../components/focusdesk_common/include
   ../../components/arbiter/include)
 add_test(NAME arbiter COMMAND test_arbiter)
+add_executable(test_presence
+  test_presence.c
+  ../../components/presence/ld2410_parser.c
+  ../../components/presence/presence_filter.c)
+target_include_directories(test_presence PRIVATE
+  ../../components/focusdesk_common/include
+  ../../components/presence/include)
+add_test(NAME presence COMMAND test_presence)
