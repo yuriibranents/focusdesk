@@ -38,3 +38,11 @@ target_include_directories(test_focus_session PRIVATE
   ../../components/focus_session/include)
 add_test(NAME focus_session COMMAND test_focus_session)
 
+
+add_executable(test_task_scheduler
+  test_task_scheduler.c
+  ../../components/task_scheduler/task_scheduler.c)
+target_include_directories(test_task_scheduler PRIVATE
+  ../../components/focusdesk_common/include
+  ../../components/task_scheduler/include)
+add_test(NAME task_scheduler COMMAND test_task_scheduler)
